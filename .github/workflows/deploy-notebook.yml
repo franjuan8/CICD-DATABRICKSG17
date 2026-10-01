@@ -1,14 +1,11 @@
 name: Dynamic Databricks Notebook Deploy
-
 on:
   push:
     branches:
       - main
-
 jobs:
   deploy:
     runs-on: ubuntu-latest
-
     steps:
     - name: Checkout Repository
       uses: actions/checkout@v3
@@ -21,10 +18,8 @@ jobs:
         ORIGIN_HOST=${{ secrets.DATABRICKS_ORIGIN_HOST }}
         ORIGIN_TOKEN=${{ secrets.DATABRICKS_ORIGIN_TOKEN }}
         NOTEBOOK_BASE="/Workspace/Users/yuliza_jfk@hotmail.com/CICD-DATABRICKSG17"
-        NOTEBOOKS=("ntb_prueba")  # Agrega más según necesitesas
-
+        NOTEBOOKS=("ntb_prueba")  # Agrega más según necesites
         mkdir -p notebooks_to_deploy
-
         for nb in "${NOTEBOOKS[@]}"; do
           echo "Exportando $nb en modo raw..."
           curl -s -X GET \
@@ -37,21 +32,18 @@ jobs:
       run: |
         DEST_HOST=${{ secrets.DATABRICKS_DEST_HOST }}
         DEST_TOKEN=${{ secrets.DATABRICKS_DEST_TOKEN }}
-        DEST_BASE="/py"
-
+        DEST_BASE="/py/scripts/main"
+        echo "Creando carpeta $DEST_BASE si no existe..."
+        curl -s -X POST \
+          -H "Authorization: Bearer $DEST_TOKEN" \
+          -H "Content-Type: application/json" \
+          -d "{\"path\":\"$DEST_BASE\"}" \
+          "$DEST_HOST/api/2.0/workspace/mkdirs"
         for file in notebooks_to_deploy/*.py; do
           name=$(basename "$file" .py)
           dest_path="$DEST_BASE/$name"
-
-          echo "Creando carpeta $DEST_BASE si no existe..."
-          curl -s -X POST \
-            -H "Authorization: Bearer $DEST_TOKEN" \
-            -H "Content-Type: application/json" \
-            -d "{\"path\":\"$DEST_BASE\"}" \
-            "$DEST_HOST/api/2.0/workspace/mkdirs"
-
           echo "Importando $file → $dest_path"
-          curl -s -X POST \
+          response=$(curl -s -X POST \
             -H "Authorization: Bearer $DEST_TOKEN" \
             -H "Content-Type: multipart/form-data" \
             -F "path=$dest_path" \
@@ -59,11 +51,175 @@ jobs:
             -F "language=PYTHON" \
             -F "overwrite=true" \
             -F "content=@$file" \
-            "$DEST_HOST/api/2.0/workspace/import"
+            "$DEST_HOST/api/2.0/workspace/import")
+          echo "Response: $response"
         done
 
+    - name: Check if workflow exists and delete if necessary
+      run: |
+        DEST_HOST=${{ secrets.DATABRICKS_DEST_HOST }}
+        DEST_TOKEN=${{ secrets.DATABRICKS_DEST_TOKEN }}
+        WORKFLOW_NAME="WF_ADB"
+
+        echo "Verificando si existe el workflow: $WORKFLOW_NAME"
+
+        # Buscar por nombre (filtro nativo de la API)
+        workflows_response=$(curl -s -G \
+          -H "Authorization: Bearer $DEST_TOKEN" \
+          --data-urlencode "name=$WORKFLOW_NAME" \
+          "$DEST_HOST/api/2.1/jobs/list")
+
+        existing_job_ids=$(echo "$workflows_response" | jq -r --arg name "$WORKFLOW_NAME" '.jobs[]? | select(.settings.name == $name) | .job_id')
+
+        if [ -n "$existing_job_ids" ]; then
+          for existing_job_id in $existing_job_ids; do
+            echo "Workflow encontrado con ID: $existing_job_id. Eliminando..."
+            delete_response=$(curl -s -X POST \
+              -H "Authorization: Bearer $DEST_TOKEN" \
+              -H "Content-Type: application/json" \
+              -d "{\"job_id\": $existing_job_id}" \
+              "$DEST_HOST/api/2.1/jobs/delete")
+            echo "Delete response: $delete_response"
+          done
+        else
+          echo "No se encontró workflow existente con nombre: $WORKFLOW_NAME"
+        fi
+
+    - name: Create Databricks Workflow WF_ADB (Serverless)
+      run: |
+        DEST_HOST=${{ secrets.DATABRICKS_DEST_HOST }}
+        DEST_TOKEN=${{ secrets.DATABRICKS_DEST_TOKEN }}
+        DEST_BASE="/py/scripts/main"
+
+        echo "Creando workflow: WF_ADB con serverless compute"
+
+        # Sin existing_cluster_id / new_cluster / job_cluster_key => las tareas corren en serverless
+        cat > workflow_config.json << EOF
+        {
+          "name": "WF_ADB",
+          "format": "MULTI_TASK",
+          "performance_target": "STANDARD",
+          "tasks": [
+            {
+              "task_key": "tarea1_notebook1",
+              "description": "Ejecuta notebook ntbk_1",
+              "notebook_task": {
+                "notebook_path": "$DEST_BASE/ntbk_1",
+                "source": "WORKSPACE"
+              },
+              "timeout_seconds": 3600,
+              "max_retries": 2
+            },
+            {
+              "task_key": "tarea2_notebook2",
+              "description": "Ejecuta notebook ntbk_2",
+              "notebook_task": {
+                "notebook_path": "$DEST_BASE/ntbk_2",
+                "source": "WORKSPACE"
+              },
+              "timeout_seconds": 3600,
+              "max_retries": 2,
+              "depends_on": [
+                { "task_key": "tarea1_notebook1" }
+              ]
+            }
+          ],
+          "schedule": {
+            "quartz_cron_expression": "0 0 8 * * ?",
+            "timezone_id": "America/Lima",
+            "pause_status": "PAUSED"
+          },
+          "email_notifications": {
+            "on_failure": [],
+            "on_success": [],
+            "no_alert_for_skipped_runs": false
+          },
+          "timeout_seconds": 7200,
+          "max_concurrent_runs": 1,
+          "tags": {
+            "environment": "production",
+            "created_by": "github_actions",
+            "project": "automated_deployment",
+            "compute": "serverless"
+          }
+        }
+        EOF
+
+        # Validar que el JSON generado sea correcto
+        jq empty workflow_config.json || { echo " JSON inválido"; cat workflow_config.json; exit 1; }
+
+        create_response=$(curl -s -X POST \
+          -H "Authorization: Bearer $DEST_TOKEN" \
+          -H "Content-Type: application/json" \
+          -d @workflow_config.json \
+          "$DEST_HOST/api/2.1/jobs/create")
+
+        echo "Workflow creation response: $create_response"
+
+        job_id=$(echo "$create_response" | jq -r '.job_id')
+
+        if [ "$job_id" != "" ] && [ "$job_id" != "null" ]; then
+          echo "Workflow 'WF_ADB' creado exitosamente con ID: $job_id"
+          echo "JOB_ID=$job_id" >> $GITHUB_ENV
+        else
+          echo "Error al crear el workflow"
+          echo "Si el error menciona compute/cluster, verifica que el workspace tenga Unity Catalog y serverless for workflows habilitado."
+          echo "Response completo: $create_response"
+          exit 1
+        fi
+
+    - name: Validate Workflow Configuration
+      run: |
+        DEST_HOST=${{ secrets.DATABRICKS_DEST_HOST }}
+        DEST_TOKEN=${{ secrets.DATABRICKS_DEST_TOKEN }}
+        JOB_ID="${{ env.JOB_ID }}"
+
+        echo "Validando la configuración del workflow creado (ID: $JOB_ID)..."
+
+        job_details=$(curl -s -X GET \
+          -H "Authorization: Bearer $DEST_TOKEN" \
+          "$DEST_HOST/api/2.1/jobs/get?job_id=$JOB_ID")
+
+        if [ "$(echo "$job_details" | jq -r '.job_id // empty')" = "" ]; then
+          echo "No se pudo obtener el workflow creado"
+          echo "$job_details"
+          exit 1
+        fi
+
+        echo "Resumen del workflow:"
+        echo "Nombre: $(echo "$job_details" | jq -r '.settings.name')"
+        echo "Número de tareas: $(echo "$job_details" | jq '.settings.tasks | length')"
+        echo ""
+        echo "Tareas configuradas:"
+        echo "$job_details" | jq -r '.settings.tasks[] | "- " + .task_key + " → " + .notebook_task.notebook_path'
+        echo ""
+        echo "Cómputo por tarea:"
+        echo "$job_details" | jq -r '.settings.tasks[] | "- " + .task_key + " → " + (if (.existing_cluster_id or .new_cluster or .job_cluster_key) then "cluster clásico" else "serverless" end)'
+        echo "Performance target: $(echo "$job_details" | jq -r '.settings.performance_target // "STANDARD"')"
+
+        # Fallar si alguna tarea quedó con cluster clásico
+        classic=$(echo "$job_details" | jq '[.settings.tasks[] | select(.existing_cluster_id or .new_cluster or .job_cluster_key)] | length')
+        if [ "$classic" != "0" ]; then
+          echo "Hay $classic tarea(s) que no usan serverless"
+          exit 1
+        fi
+
     - name: Clean up
-      run: rm -rf notebooks_to_deploy
+      if: always()
+      run: |
+        rm -rf notebooks_to_deploy
+        rm -f workflow_config.json
 
     - name: Done
-      run: echo "All notebooks deployed with raw content!"
+      run: |
+        echo "¡Despliegue completado exitosamente!"
+        echo ""
+        echo "Resumen:"
+        echo "Notebooks desplegados: ntbk_1, ntbk_2"
+        echo "Workflow creado: WF_ADB (ID: ${{ env.JOB_ID }})"
+        echo "Tareas configuradas:"
+        echo "   - tarea1_notebook1 (ntbk_1)"
+        echo "   - tarea2_notebook2 (ntbk_2)"
+        echo "Cómputo: serverless (performance_target: STANDARD)"
+        echo ""
+        echo "🔗 Accede a tu workspace de Databricks para ver el workflow en la sección 'Jobs & Pipelines'"
