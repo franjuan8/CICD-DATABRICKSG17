@@ -18,7 +18,7 @@ jobs:
         ORIGIN_HOST=${{ secrets.DATABRICKS_ORIGIN_HOST }}
         ORIGIN_TOKEN=${{ secrets.DATABRICKS_ORIGIN_TOKEN }}
         NOTEBOOK_BASE="/Workspace/Users/yuliza_jfk@hotmail.com/CICD-DATABRICKSG17"
-        NOTEBOOKS=("ntb_prueba")  # Agrega más según necesites
+        NOTEBOOKS=("0.Preparar_Ambiente" "1.Ingest_data_dim")  # Agrega más según necesites
         mkdir -p notebooks_to_deploy
         for nb in "${NOTEBOOKS[@]}"; do
           echo "Exportando $nb en modo raw..."
