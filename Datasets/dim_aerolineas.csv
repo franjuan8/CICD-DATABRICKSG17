@@ -1,0 +1,7 @@
+﻿aerolinea_id,nombre_aerolinea,pais_sede,hub_iata,modelo_negocio,fecha_inicio_operaciones,activo
+AL01,Andes Air Peru,Peru,LIM,FS,2020-02-01,1
+AL02,Pacific Wings,Peru,LIM,LC,2018-04-15,1
+AL03,Altura Jet,Peru,LIM,LC,2019-06-18,1
+AL04,Condor Sur,Chile,SCL,FS,2015-10-11,1
+AL05,Caribe Conexion,Colombia,BOG,FS,2012-09-20,1
+AL06,Istmo Air,Panama,PTY,FS,2010-05-08,1
