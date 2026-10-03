@@ -1,225 +1,667 @@
-name: Dynamic Databricks Notebook Deploy
+name: Validar y desplegar ETL Aerolineas
+
 on:
   push:
-    branches:
-      - main
+    branches: [develop, main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: aerolineas-${{ github.ref_name == 'main' && 'prod' || 'dev' }}
+  cancel-in-progress: false
+
 jobs:
   deploy:
+    if: github.ref_name == 'develop' || github.ref_name == 'main'
     runs-on: ubuntu-latest
-    steps:
-    - name: Checkout Repository
-      uses: actions/checkout@v3
+    timeout-minutes: 150
 
-    - name: Install jq & curl
-      run: sudo apt-get update && sudo apt-get install -y jq curl
+    environment: ${{ github.ref_name == 'main' && 'prod' || 'dev' }}
 
-    - name: Export multiple notebooks (raw)
-      run: |
-        ORIGIN_HOST=${{ secrets.DATABRICKS_ORIGIN_HOST }}
-        ORIGIN_TOKEN=${{ secrets.DATABRICKS_ORIGIN_TOKEN }}
-        NOTEBOOK_BASE="/Workspace/Users/yuliza_jfk@hotmail.com/CICD-DATABRICKSG17"
-        NOTEBOOKS=("ntb_prueba")  # Agrega más según necesites
-        mkdir -p notebooks_to_deploy
-        for nb in "${NOTEBOOKS[@]}"; do
-          echo "Exportando $nb en modo raw..."
-          curl -s -X GET \
-            -H "Authorization: Bearer $ORIGIN_TOKEN" \
-            "$ORIGIN_HOST/api/2.0/workspace/export?path=$NOTEBOOK_BASE/$nb&format=SOURCE&direct_download=true" \
-            --output "notebooks_to_deploy/$nb.py"
-        done
+    env:
+      NOTEBOOK_BASE: /Workspace/Users/yuliza_jfk@hotmail.com/CICD-DATABRICKSG17
 
-    - name: Deploy notebooks to Destination Workspace
-      run: |
-        DEST_HOST=${{ secrets.DATABRICKS_DEST_HOST }}
-        DEST_TOKEN=${{ secrets.DATABRICKS_DEST_TOKEN }}
-        DEST_BASE="/py/scripts/main"
-        echo "Creando carpeta $DEST_BASE si no existe..."
-        curl -s -X POST \
-          -H "Authorization: Bearer $DEST_TOKEN" \
-          -H "Content-Type: application/json" \
-          -d "{\"path\":\"$DEST_BASE\"}" \
-          "$DEST_HOST/api/2.0/workspace/mkdirs"
-        for file in notebooks_to_deploy/*.py; do
-          name=$(basename "$file" .py)
-          dest_path="$DEST_BASE/$name"
-          echo "Importando $file → $dest_path"
-          response=$(curl -s -X POST \
-            -H "Authorization: Bearer $DEST_TOKEN" \
-            -H "Content-Type: multipart/form-data" \
-            -F "path=$dest_path" \
-            -F "format=SOURCE" \
-            -F "language=PYTHON" \
-            -F "overwrite=true" \
-            -F "content=@$file" \
-            "$DEST_HOST/api/2.0/workspace/import")
-          echo "Response: $response"
-        done
+      ORIGIN_HOST: ${{ secrets.DATABRICKS_ORIGIN_HOST }}
+      ORIGIN_TOKEN: ${{ secrets.DATABRICKS_ORIGIN_TOKEN }}
+      DEST_HOST: ${{ secrets.DATABRICKS_DEST_HOST }}
+      DEST_TOKEN: ${{ secrets.DATABRICKS_DEST_TOKEN }}
 
-    - name: Check if workflow exists and delete if necessary
-      run: |
-        DEST_HOST=${{ secrets.DATABRICKS_DEST_HOST }}
-        DEST_TOKEN=${{ secrets.DATABRICKS_DEST_TOKEN }}
-        WORKFLOW_NAME="WF_ADB"
+      DEST_BASE: ${{ vars.DEST_NOTEBOOK_BASE }}
+      CLUSTER_NAME: ${{ vars.CLUSTER_NAME }}
+      STORAGE_NAME: ${{ vars.STORAGE_NAME }}
+      CATALOG_NAME: ${{ vars.CATALOG_NAME }}
+      STORAGE_CREDENTIAL: ${{ vars.STORAGE_CREDENTIAL }}
+      SECRET_SCOPE: ${{ vars.SECRET_SCOPE }}
+      RUN_AS_SERVICE_PRINCIPAL: ${{ vars.RUN_AS_SERVICE_PRINCIPAL }}
 
-        echo "Verificando si existe el workflow: $WORKFLOW_NAME"
+      BRANCH_NAME: ${{ github.ref_name }}
+      COMMIT_SHA: ${{ github.sha }}
+      WORKFLOW_RUN_ID: ${{ github.run_id }}
 
-        # Buscar por nombre (filtro nativo de la API)
-        workflows_response=$(curl -s -G \
-          -H "Authorization: Bearer $DEST_TOKEN" \
-          --data-urlencode "name=$WORKFLOW_NAME" \
-          "$DEST_HOST/api/2.1/jobs/list")
+      JOB_NAME: WF_AEROLINEAS_PROD
+      PYTHONUNBUFFERED: '1'
 
-        existing_job_ids=$(echo "$workflows_response" | jq -r --arg name "$WORKFLOW_NAME" '.jobs[]? | select(.settings.name == $name) | .job_id')
-
-        if [ -n "$existing_job_ids" ]; then
-          for existing_job_id in $existing_job_ids; do
-            echo "Workflow encontrado con ID: $existing_job_id. Eliminando..."
-            delete_response=$(curl -s -X POST \
-              -H "Authorization: Bearer $DEST_TOKEN" \
-              -H "Content-Type: application/json" \
-              -d "{\"job_id\": $existing_job_id}" \
-              "$DEST_HOST/api/2.1/jobs/delete")
-            echo "Delete response: $delete_response"
-          done
-        else
-          echo "No se encontró workflow existente con nombre: $WORKFLOW_NAME"
-        fi
-
-    - name: Create Databricks Workflow WF_ADB (Serverless)
-      run: |
-        DEST_HOST=${{ secrets.DATABRICKS_DEST_HOST }}
-        DEST_TOKEN=${{ secrets.DATABRICKS_DEST_TOKEN }}
-        DEST_BASE="/py/scripts/main"
-
-        echo "Creando workflow: WF_ADB con serverless compute"
-
-        # Sin existing_cluster_id / new_cluster / job_cluster_key => las tareas corren en serverless
-        cat > workflow_config.json << EOF
-        {
-          "name": "WF_ADB",
-          "format": "MULTI_TASK",
-          "performance_target": "STANDARD",
-          "tasks": [
-            {
-              "task_key": "tarea1_notebook1",
-              "description": "Ejecuta notebook ntbk_1",
-              "notebook_task": {
-                "notebook_path": "$DEST_BASE/ntbk_1",
-                "source": "WORKSPACE"
-              },
-              "timeout_seconds": 3600,
-              "max_retries": 2
-            },
-            {
-              "task_key": "tarea2_notebook2",
-              "description": "Ejecuta notebook ntbk_2",
-              "notebook_task": {
-                "notebook_path": "$DEST_BASE/ntbk_2",
-                "source": "WORKSPACE"
-              },
-              "timeout_seconds": 3600,
-              "max_retries": 2,
-              "depends_on": [
-                { "task_key": "tarea1_notebook1" }
-              ]
+      NOTEBOOK_PLAN_JSON: >-
+        [
+          {
+            "task_key": "preparar_ambiente",
+            "notebook": "Proceso/0.Preparar_Ambiente",
+            "depends_on": []
+          },
+          {
+            "task_key": "ingesta_dim",
+            "notebook": "Proceso/1.Ingest_data_dim",
+            "depends_on": ["preparar_ambiente"],
+            "parameters": {
+              "schema": "bronze",
+              "schema_sink": "bronze"
             }
-          ],
-          "schedule": {
-            "quartz_cron_expression": "0 0 8 * * ?",
-            "timezone_id": "America/Lima",
-            "pause_status": "PAUSED"
           },
-          "email_notifications": {
-            "on_failure": [],
-            "on_success": [],
-            "no_alert_for_skipped_runs": false
+          {
+            "task_key": "ingesta_fact",
+            "notebook": "Proceso/1.Ingest_data_fact",
+            "depends_on": ["ingesta_dim"],
+            "parameters": {
+              "schema": "bronze",
+              "schema_sink": "bronze"
+            }
           },
-          "timeout_seconds": 7200,
-          "max_concurrent_runs": 1,
-          "tags": {
-            "environment": "production",
-            "created_by": "github_actions",
-            "project": "automated_deployment",
-            "compute": "serverless"
+          {
+            "task_key": "silver_dim",
+            "notebook": "Proceso/2.Transform_dim",
+            "depends_on": ["ingesta_fact"],
+            "parameters": {
+              "schema_source": "bronze",
+              "schema_sink": "silver"
+            }
+          },
+          {
+            "task_key": "silver_fact",
+            "notebook": "Proceso/2.Transform_fact",
+            "depends_on": ["silver_dim"],
+            "parameters": {
+              "schema_source": "bronze",
+              "schema_sink": "silver"
+            }
+          },
+          {
+            "task_key": "gold",
+            "notebook": "Proceso/3.Transform_golden",
+            "depends_on": ["silver_fact"],
+            "parameters": {
+              "schema_source": "silver",
+              "schema_sink": "gold"
+            }
+          },
+          {
+            "task_key": "grants",
+            "notebook": "Seguridad/4.Grants",
+            "depends_on": ["gold"]
           }
-        }
-        EOF
+        ]
 
-        # Validar que el JSON generado sea correcto
-        jq empty workflow_config.json || { echo " JSON inválido"; cat workflow_config.json; exit 1; }
+    steps:
+      - name: Descargar repositorio
+        uses: actions/checkout@v4
 
-        create_response=$(curl -s -X POST \
-          -H "Authorization: Bearer $DEST_TOKEN" \
-          -H "Content-Type: application/json" \
-          -d @workflow_config.json \
-          "$DEST_HOST/api/2.1/jobs/create")
+      - name: Exportar, validar y desplegar notebooks
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import base64
+          import json
+          import os
+          import sys
+          import time
 
-        echo "Workflow creation response: $create_response"
+          from urllib.request import Request, urlopen
+          from urllib.error import HTTPError, URLError
+          from urllib.parse import urlencode, urlparse
 
-        job_id=$(echo "$create_response" | jq -r '.job_id')
+          def required(name):
+              value = os.getenv(name, '').strip()
 
-        if [ "$job_id" != "" ] && [ "$job_id" != "null" ]; then
-          echo "Workflow 'WF_ADB' creado exitosamente con ID: $job_id"
-          echo "JOB_ID=$job_id" >> $GITHUB_ENV
-        else
-          echo "Error al crear el workflow"
-          echo "Si el error menciona compute/cluster, verifica que el workspace tenga Unity Catalog y serverless for workflows habilitado."
-          echo "Response completo: $create_response"
-          exit 1
-        fi
+              if not value:
+                  raise RuntimeError(
+                      f'Falta configurar {name} en GitHub.'
+                  )
 
-    - name: Validate Workflow Configuration
-      run: |
-        DEST_HOST=${{ secrets.DATABRICKS_DEST_HOST }}
-        DEST_TOKEN=${{ secrets.DATABRICKS_DEST_TOKEN }}
-        JOB_ID="${{ env.JOB_ID }}"
+              return value
 
-        echo "Validando la configuración del workflow creado (ID: $JOB_ID)..."
+          def validate_host(host):
+              parsed = urlparse(host)
 
-        job_details=$(curl -s -X GET \
-          -H "Authorization: Bearer $DEST_TOKEN" \
-          "$DEST_HOST/api/2.1/jobs/get?job_id=$JOB_ID")
+              if (
+                  parsed.scheme != 'https'
+                  or not parsed.hostname
+                  or parsed.username
+                  or parsed.password
+                  or parsed.path not in ('', '/')
+                  or parsed.query
+                  or parsed.fragment
+              ):
+                  raise RuntimeError(
+                      'El host debe ser una URL HTTPS del workspace, '
+                      'sin rutas, parametros ni credenciales.'
+                  )
 
-        if [ "$(echo "$job_details" | jq -r '.job_id // empty')" = "" ]; then
-          echo "No se pudo obtener el workflow creado"
-          echo "$job_details"
-          exit 1
-        fi
+          def api(host, token, endpoint, body=None, method=None):
+              validate_host(host)
 
-        echo "Resumen del workflow:"
-        echo "Nombre: $(echo "$job_details" | jq -r '.settings.name')"
-        echo "Número de tareas: $(echo "$job_details" | jq '.settings.tasks | length')"
-        echo ""
-        echo "Tareas configuradas:"
-        echo "$job_details" | jq -r '.settings.tasks[] | "- " + .task_key + " → " + .notebook_task.notebook_path'
-        echo ""
-        echo "Cómputo por tarea:"
-        echo "$job_details" | jq -r '.settings.tasks[] | "- " + .task_key + " → " + (if (.existing_cluster_id or .new_cluster or .job_cluster_key) then "cluster clásico" else "serverless" end)'
-        echo "Performance target: $(echo "$job_details" | jq -r '.settings.performance_target // "STANDARD"')"
+              headers = {
+                  'Authorization': f'Bearer {token}'
+              }
 
-        # Fallar si alguna tarea quedó con cluster clásico
-        classic=$(echo "$job_details" | jq '[.settings.tasks[] | select(.existing_cluster_id or .new_cluster or .job_cluster_key)] | length')
-        if [ "$classic" != "0" ]; then
-          echo "Hay $classic tarea(s) que no usan serverless"
-          exit 1
-        fi
+              data = None
 
-    - name: Clean up
-      if: always()
-      run: |
-        rm -rf notebooks_to_deploy
-        rm -f workflow_config.json
+              if body is not None:
+                  headers['Content-Type'] = 'application/json'
+                  data = json.dumps(body).encode('utf-8')
 
-    - name: Done
-      run: |
-        echo "¡Despliegue completado exitosamente!"
-        echo ""
-        echo "Resumen:"
-        echo "Notebooks desplegados: ntbk_1, ntbk_2"
-        echo "Workflow creado: WF_ADB (ID: ${{ env.JOB_ID }})"
-        echo "Tareas configuradas:"
-        echo "   - tarea1_notebook1 (ntbk_1)"
-        echo "   - tarea2_notebook2 (ntbk_2)"
-        echo "Cómputo: serverless (performance_target: STANDARD)"
-        echo ""
-        echo "🔗 Accede a tu workspace de Databricks para ver el workflow en la sección 'Jobs & Pipelines'"
+              request = Request(
+                  host.rstrip('/') + endpoint,
+                  data=data,
+                  headers=headers,
+                  method=method or (
+                      'POST' if body is not None else 'GET'
+                  )
+              )
+
+              try:
+                  with urlopen(request, timeout=60) as response:
+                      raw = response.read()
+                      result = json.loads(raw) if raw else {}
+
+              except HTTPError as err:
+                  raise RuntimeError(
+                      f'API {endpoint.split("?")[0]}: HTTP {err.code}'
+                  ) from None
+
+              except URLError:
+                  raise RuntimeError(
+                      f'Error de conexion: {endpoint.split("?")[0]}'
+                  ) from None
+
+              if 'error_code' in result:
+                  raise RuntimeError(
+                      f'API {endpoint.split("?")[0]}: '
+                      f'{result["error_code"]}'
+                  )
+
+              return result
+
+          # --------------------------------------------------
+          # 1. Validar rama, configuracion y plan
+          # --------------------------------------------------
+          branch = required('BRANCH_NAME')
+
+          if branch not in ('develop', 'main'):
+              raise RuntimeError(
+                  'Este workflow solo admite develop y main.'
+              )
+
+          origin_host = required('ORIGIN_HOST')
+          origin_token = required('ORIGIN_TOKEN')
+          base = required('NOTEBOOK_BASE').rstrip('/')
+
+          validate_host(origin_host)
+
+          plan = json.loads(required('NOTEBOOK_PLAN_JSON'))
+
+          if not isinstance(plan, list) or not plan:
+              raise RuntimeError(
+                  'NOTEBOOK_PLAN_JSON debe ser una lista no vacia.'
+              )
+
+          known = set()
+
+          for task in plan:
+              key = task.get('task_key')
+              notebook = task.get('notebook')
+              dependencies = task.get('depends_on', [])
+
+              if (
+                  not isinstance(key, str)
+                  or not isinstance(notebook, str)
+                  or not key
+                  or not notebook
+                  or key in known
+              ):
+                  raise RuntimeError(
+                      'Cada tarea necesita task_key unico y notebook.'
+                  )
+
+              if (
+                  notebook.startswith('/')
+                  or '..' in notebook.split('/')
+              ):
+                  raise RuntimeError(
+                      'El notebook debe tener una ruta relativa '
+                      'dentro de NOTEBOOK_BASE.'
+                  )
+
+              if (
+                  not isinstance(dependencies, list)
+                  or not all(
+                      isinstance(value, str)
+                      for value in dependencies
+                  )
+              ):
+                  raise RuntimeError(
+                      'depends_on debe ser una lista de task_key.'
+                  )
+
+              if not set(dependencies).issubset(known):
+                  raise RuntimeError(
+                      'Ordena el plan con las dependencias '
+                      'antes de sus tareas.'
+                  )
+
+              if not isinstance(task.get('parameters', {}), dict):
+                  raise RuntimeError(
+                      'parameters debe ser un objeto JSON.'
+                  )
+
+              known.add(key)
+
+          # --------------------------------------------------
+          # 2. Exportar notebooks del workspace origen
+          # --------------------------------------------------
+          notebooks = list(dict.fromkeys(
+              [task['notebook'] for task in plan]
+              + ['Reversion/reverso']
+          ))
+
+          exported = {}
+
+          for notebook in notebooks:
+              source_path = base + '/' + notebook
+
+              status = api(
+                  origin_host,
+                  origin_token,
+                  '/api/2.0/workspace/get-status?'
+                  + urlencode({'path': source_path})
+              )
+
+              if status.get('object_type') != 'NOTEBOOK':
+                  raise RuntimeError(
+                      f'La ruta no corresponde a un notebook: {notebook}'
+                  )
+
+              language = status.get('language')
+
+              if language not in ('PYTHON', 'SQL', 'SCALA', 'R'):
+                  raise RuntimeError(
+                      f'Lenguaje no reconocido en {notebook}: {language}'
+                  )
+
+              result = api(
+                  origin_host,
+                  origin_token,
+                  '/api/2.0/workspace/export?'
+                  + urlencode({
+                      'path': source_path,
+                      'format': 'SOURCE'
+                  })
+              )
+
+              content = base64.b64decode(
+                  result['content'],
+                  validate=True
+              )
+
+              # Validar sintaxis Python sin ejecutar el notebook
+              if language == 'PYTHON':
+                  compile(
+                      content.decode('utf-8-sig'),
+                      notebook,
+                      'exec'
+                  )
+
+              exported[notebook] = {
+                  'content': content,
+                  'language': language
+              }
+
+              print(f'Exportado: {notebook} ({language})')
+
+          # --------------------------------------------------
+          # 3. develop: finalizar despues de validar
+          # --------------------------------------------------
+          if branch == 'develop':
+              print(
+                  'Validacion develop terminada. '
+                  'No se despliega ni se ejecuta un cluster.'
+              )
+
+              sys.exit(0)
+
+          # --------------------------------------------------
+          # 4. main: validar configuracion de produccion
+          # --------------------------------------------------
+          dest_host = required('DEST_HOST')
+          dest_token = required('DEST_TOKEN')
+          dest_base = required('DEST_BASE').rstrip('/')
+
+          validate_host(dest_host)
+
+          if not dest_base.startswith('/'):
+              raise RuntimeError(
+                  'DEST_NOTEBOOK_BASE debe ser una ruta absoluta.'
+              )
+
+          if origin_host.rstrip('/') == dest_host.rstrip('/'):
+              raise RuntimeError(
+                  'Origen y destino deben ser workspaces distintos.'
+              )
+
+          cluster_name = required('CLUSTER_NAME')
+          storage_name = required('STORAGE_NAME')
+          catalog_name = required('CATALOG_NAME')
+          credential = required('STORAGE_CREDENTIAL')
+
+          clusters = api(
+              dest_host,
+              dest_token,
+              '/api/2.0/clusters/list'
+          ).get('clusters', [])
+
+          matches = [
+              cluster
+              for cluster in clusters
+              if cluster.get('cluster_name') == cluster_name
+          ]
+
+          if len(matches) != 1:
+              raise RuntimeError(
+                  'Debe existir exactamente un cluster '
+                  'con CLUSTER_NAME en prod.'
+              )
+
+          cluster_id = matches[0]['cluster_id']
+
+          common = {
+              'ambiente': 'prod',
+              'catalog': catalog_name,
+              'catalogo': catalog_name,
+              'storageName': storage_name,
+              'storageLocation': storage_name,
+              'credential': credential,
+              'secret_scope': os.getenv('SECRET_SCOPE', ''),
+              'path_inicio': (
+                  f'abfss://raw@{storage_name}.dfs.core.windows.net/'
+              )
+          }
+
+          # --------------------------------------------------
+          # 5. Localizar el Job y comprobar ejecuciones activas
+          # --------------------------------------------------
+          job_name = required('JOB_NAME')
+          jobs = []
+          page_token = None
+
+          while True:
+              query_parameters = {'limit': 100}
+
+              if page_token:
+                  query_parameters['page_token'] = page_token
+
+              page = api(
+                  dest_host,
+                  dest_token,
+                  '/api/2.1/jobs/list?'
+                  + urlencode(query_parameters)
+              )
+
+              jobs.extend(page.get('jobs', []))
+              page_token = page.get('next_page_token')
+
+              if not page_token:
+                  break
+
+          matching_jobs = [
+              job
+              for job in jobs
+              if job.get('settings', {}).get('name') == job_name
+          ]
+
+          if len(matching_jobs) > 1:
+              raise RuntimeError(
+                  'Hay Jobs duplicados con JOB_NAME. '
+                  'Resuelvelos antes del despliegue.'
+              )
+
+          job_id = (
+              matching_jobs[0]['job_id']
+              if matching_jobs else None
+          )
+
+          if job_id is not None:
+              active_runs = api(
+                  dest_host,
+                  dest_token,
+                  '/api/2.1/jobs/runs/list?'
+                  + urlencode({
+                      'job_id': job_id,
+                      'active_only': 'true',
+                      'limit': 1
+                  })
+              ).get('runs', [])
+
+              if active_runs:
+                  raise RuntimeError(
+                      'El Job tiene una ejecucion activa. '
+                      'Espera a que termine antes de desplegar.'
+                  )
+
+          # --------------------------------------------------
+          # 6. Importar notebooks en produccion
+          # --------------------------------------------------
+          for notebook, data in exported.items():
+              destination = dest_base + '/' + notebook
+
+              api(
+                  dest_host,
+                  dest_token,
+                  '/api/2.0/workspace/mkdirs',
+                  {
+                      'path': destination.rsplit('/', 1)[0]
+                  }
+              )
+
+              api(
+                  dest_host,
+                  dest_token,
+                  '/api/2.0/workspace/import',
+                  {
+                      'path': destination,
+                      'format': 'SOURCE',
+                      'language': data['language'],
+                      'overwrite': True,
+                      'content': base64.b64encode(
+                          data['content']
+                      ).decode('ascii')
+                  }
+              )
+
+              print(f'Desplegado: {notebook}')
+
+          # --------------------------------------------------
+          # 7. Construir tareas del ETL
+          # --------------------------------------------------
+          tasks = []
+
+          for item in plan:
+              parameters = dict(common)
+
+              parameters.update({
+                  key: str(value)
+                  for key, value in item.get('parameters', {}).items()
+              })
+
+              tasks.append({
+                  'task_key': item['task_key'],
+                  'existing_cluster_id': cluster_id,
+                  'notebook_task': {
+                      'notebook_path': (
+                          dest_base + '/' + item['notebook']
+                      ),
+                      'source': 'WORKSPACE',
+                      'base_parameters': parameters
+                  },
+                  'depends_on': [
+                      {'task_key': dependency}
+                      for dependency in item.get('depends_on', [])
+                  ],
+                  'run_if': 'ALL_SUCCESS',
+                  'timeout_seconds': 3600,
+                  'max_retries': 0
+              })
+
+          settings = {
+              'name': job_name,
+              'tasks': tasks,
+              'timeout_seconds': 7200,
+              'max_concurrent_runs': 1,
+              'tags': {
+                  'environment': 'prod',
+                  'project': 'aerolineas',
+                  'trigger_commit': required('COMMIT_SHA')
+              }
+          }
+
+          run_as = os.getenv(
+              'RUN_AS_SERVICE_PRINCIPAL', ''
+          ).strip()
+
+          if run_as:
+              settings['run_as'] = {
+                  'service_principal_name': run_as
+              }
+
+          # --------------------------------------------------
+          # 8. Crear o actualizar el Job
+          # --------------------------------------------------
+          if job_id is not None:
+              api(
+                  dest_host,
+                  dest_token,
+                  '/api/2.1/jobs/reset',
+                  {
+                      'job_id': job_id,
+                      'new_settings': settings
+                  }
+              )
+
+              print(f'Job actualizado: {job_id}')
+
+          else:
+              job_id = api(
+                  dest_host,
+                  dest_token,
+                  '/api/2.1/jobs/create',
+                  settings
+              )['job_id']
+
+              print(f'Job creado: {job_id}')
+
+          # --------------------------------------------------
+          # 9. Ejecutar el ETL en produccion
+          # --------------------------------------------------
+          run_id = api(
+              dest_host,
+              dest_token,
+              '/api/2.1/jobs/run-now',
+              {
+                  'job_id': job_id,
+                  'idempotency_token': (
+                      'aerolineas-' + required('WORKFLOW_RUN_ID')
+                  )
+              }
+          )['run_id']
+
+          run_url = (
+              f'{dest_host.rstrip("/")}'
+              f'/jobs/{job_id}/runs/{run_id}'
+          )
+
+          print(f'Ejecucion enviada: {run_url}')
+
+          summary_path = os.getenv('GITHUB_STEP_SUMMARY')
+
+          if summary_path:
+              with open(
+                  summary_path, 'a', encoding='utf-8'
+              ) as summary:
+                  summary.write(
+                      f'Job Databricks: [{job_name}]({run_url})\n\n'
+                  )
+                  summary.write(
+                      'Reversion/reverso fue desplegado '
+                      'y no forma parte de las tareas ejecutables.\n\n'
+                  )
+
+          # --------------------------------------------------
+          # 10. Esperar resultado del Job
+          # --------------------------------------------------
+          deadline = time.monotonic() + 7500
+
+          terminal_states = {
+              'TERMINATED',
+              'SKIPPED',
+              'INTERNAL_ERROR'
+          }
+
+          while time.monotonic() < deadline:
+              run = api(
+                  dest_host,
+                  dest_token,
+                  '/api/2.1/jobs/runs/get?'
+                  + urlencode({'run_id': run_id})
+              )
+
+              state = run['state']
+              life = state['life_cycle_state']
+              result = state.get('result_state', '')
+
+              print(f'Estado: {life} / {result}')
+
+              if life in terminal_states:
+                  if result != 'SUCCESS':
+                      for task in run.get('tasks', []):
+                          task_state = task.get('state', {})
+
+                          print(
+                              f'Tarea {task["task_key"]}: '
+                              f'{task_state.get("life_cycle_state", "")} / '
+                              f'{task_state.get("result_state", "")}'
+                          )
+
+                      raise RuntimeError(
+                          f'ETL finalizado sin exito: '
+                          f'{life} / {result}. Revisar {run_url}'
+                      )
+
+                  print('ETL terminado correctamente.')
+
+                  if summary_path:
+                      with open(
+                          summary_path, 'a', encoding='utf-8'
+                      ) as summary:
+                          summary.write(
+                              'Resultado ETL: **SUCCESS**\n'
+                          )
+
+                  break
+
+              time.sleep(30)
+
+          else:
+              raise RuntimeError(
+                  'Tiempo de espera agotado. '
+                  f'La ejecucion puede seguir activa: {run_url}'
+              )
+          PY
